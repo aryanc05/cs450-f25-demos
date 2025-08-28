@@ -1,0 +1,195 @@
+#! /usr/bin/env python3
+
+from copy import deepcopy
+from json import dump, load
+
+
+class _SourceReplacer:
+    def __init__(self, cell):
+        self.cell = cell
+
+    def get(self):
+        cell = self.cell
+        if "inputs" in cell:
+            self.attr = "input"
+            return cell["inputs"]
+        if "input" in cell:
+            self.attr = "input"
+            return cell["input"]
+        if "source" in cell:
+            self.attr = "source"
+            return cell["source"]
+
+        print(cell)
+        raise ValueError("no inputs found")
+
+    def set(self, inputs):
+        if self.attr == "input" and "inputs" in self.cell:
+            del self.cell["inputs"]
+
+        self.cell[self.attr] = inputs
+        self.cell.pop("id", None)
+
+
+class _CellsReplacer:
+    def __init__(self, ipynb):
+        self.ipynb = ipynb
+        self.has_worksheets = "worksheets" in ipynb
+
+    def get_cell_lists(self):
+        if self.has_worksheets:
+            return [ws["cells"] for ws in self.ipynb["worksheets"]]
+        else:
+            return [self.ipynb["cells"]]
+
+    def set_cell_lists(self, clists):
+        if self.has_worksheets:
+            for ws, cells in zip(self.ipynb["worksheets"], clists, strict=True):
+                ws["cells"] = cells
+        else:
+            cells, = clists
+            self.ipynb["cells"] = cells
+
+
+def remove_marks(cell):
+    if cell["cell_type"] != "code":
+        return [cell]
+
+    sr = _SourceReplacer(cell)
+    inputs = sr.get()
+
+    new_inputs = []
+    for input_line in inputs:
+        if ("#clear" not in input_line
+                and "#beginclear" not in input_line
+                and "#endclear" not in input_line):
+            new_inputs.append(input_line)
+
+    sr.set(new_inputs)
+
+    return [cell]
+
+
+def clear_output(cell):
+    if cell["cell_type"] != "code":
+        return [cell]
+
+    cell["outputs"] = []
+    cell.pop("prompt_number", None)
+
+    return [cell]
+
+
+def process_input_lines(inputs):
+    made_changes = False
+    clearing = False
+    new_inputs = []
+    for input_line in inputs:
+        if "#clear" in input_line:
+            return [], True
+        elif "#beginclear" in input_line:
+            clearing = True
+            made_changes = True
+            new_inputs.append(input_line.replace("#beginclear", "..."))
+        elif "#endclear" in input_line:
+            clearing = False
+        elif not clearing:
+            new_inputs.append(input_line)
+
+    if clearing:
+        contents = "".join(inputs)
+        raise ValueError(f"unterminated #beginclear in cell with '{contents}'")
+
+    return new_inputs, made_changes
+
+
+def clear_marked_inputs(cell):
+    if cell["cell_type"] != "code":
+        return [cell]
+
+    sr = _SourceReplacer(cell)
+
+    new_inputs, made_changes = process_input_lines(sr.get())
+    if made_changes:
+        sr.set(new_inputs)
+
+    return [cell]
+
+
+def clear_and_collapse_marked_inputs(cell):
+    if cell["cell_type"] != "code":
+        return [cell]
+
+    old_cell = deepcopy(cell)
+    sr = _SourceReplacer(cell)
+
+    new_inputs, made_changes = process_input_lines(sr.get())
+    if made_changes:
+        sr.set(new_inputs)
+
+    if made_changes:
+        old_cell, = remove_marks(old_cell)
+        old_cell_md = old_cell.setdefault("metadata", {})
+        old_cell_jupy = old_cell_md.setdefault("jupyter", {})
+        old_cell_jupy["source_hidden"] = True
+
+        old_sr = _SourceReplacer(old_cell)
+        old_sr.set(["# expand this cell for solution\n"] + old_sr.get())
+
+        return [cell, old_cell]
+    else:
+        return [cell]
+
+
+OP_FUNCS = {
+        "remove-marks": remove_marks,
+        "clear-output": clear_output,
+        "clear-marked-inputs": clear_marked_inputs,
+        "clear-and-collapse-marked-inputs": clear_and_collapse_marked_inputs,
+        }
+
+
+def main():
+    from argparse import ArgumentParser
+
+    parser = ArgumentParser()
+
+    parser.add_argument(
+            "operations",
+            choices=tuple(OP_FUNCS.keys()),
+            nargs="+")
+    parser.add_argument("infile", metavar="INFILE.ipynb")
+    parser.add_argument("outfile", metavar="OUTFILE.ipynb")
+
+    args = parser.parse_args()
+
+    with open(args.infile, "rt", encoding="utf-8") as inf:
+        ipynb = load(inf)
+
+    cr = _CellsReplacer(ipynb)
+    new_clists = []
+
+    for clist in cr.get_cell_lists():
+        new_cells = []
+
+        for cell in clist:
+            result_cells = [cell]
+            for op in args.operations:
+                result_cells = [
+                    rcell
+                    for cell in result_cells
+                    for rcell in OP_FUNCS[op](cell)
+                ]
+
+            new_cells.extend(result_cells)
+
+        new_clists.append(new_cells)
+
+    cr.set_cell_lists(new_clists)
+
+    with open(args.outfile, "wt") as outf:
+        dump(ipynb, outf, indent=2, sort_keys=True)
+
+
+if __name__ == "__main__":
+    main()
